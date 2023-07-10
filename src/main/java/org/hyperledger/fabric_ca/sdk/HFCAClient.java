@@ -1199,6 +1199,140 @@ public class HFCAClient {
         }
     }
 
+
+    public JsonObject getIdemixEnrollmentJson(Enrollment enrollment, String mspID) throws EnrollmentException, InvalidArgumentException {
+        if (cryptoSuite == null) {
+            throw new InvalidArgumentException("Crypto primitives not set");
+        }
+
+        if (enrollment == null) {
+            throw new InvalidArgumentException("enrollment is missing");
+        }
+
+        if (Utils.isNullOrEmpty(mspID)) {
+            throw new InvalidArgumentException("mspID cannot be null or empty");
+        }
+
+        if (enrollment instanceof IdemixEnrollment) {
+            throw new InvalidArgumentException("enrollment type must be x509");
+        }
+        final RAND rng = IdemixUtils.getRand();
+        try {
+            setUpSSL();
+
+            // Get nonce
+            IdemixEnrollmentRequest idemixEnrollReq = new IdemixEnrollmentRequest();
+            String body = idemixEnrollReq.toJson();
+            JsonObject result = httpPost(url + HFCA_IDEMIXCRED, body, enrollment);
+            if (result == null) {
+                throw new EnrollmentException("No response received for idemix enrollment request");
+            }
+            String nonceString = result.getString("Nonce");
+            if (Utils.isNullOrEmpty(nonceString)) {
+                throw new InvalidArgumentException("fabric-ca-server did not return a nonce in the response from " + HFCA_IDEMIXCRED);
+            }
+            byte[] nonceBytes = Base64.getDecoder().decode(nonceString.getBytes());
+            BIG nonce = BIG.fromBytes(nonceBytes);
+
+            // Get issuer public key and revocation key from the cainfo section of response
+            JsonObject info = result.getJsonObject("CAInfo");
+            if (info == null) {
+                throw new Exception("fabric-ca-server did not return 'cainfo' in the response from " + HFCA_IDEMIXCRED);
+            }
+            IdemixIssuerPublicKey ipk = getIssuerPublicKey(info.getString("IssuerPublicKey"));
+            PublicKey rpk = getRevocationPublicKey(info.getString("IssuerRevocationPublicKey"));
+
+            // Create and send idemix credential request
+            BIG sk = new BIG(IdemixUtils.randModOrder(rng));
+            IdemixCredRequest idemixCredRequest = new IdemixCredRequest(sk, nonce, ipk);
+            idemixEnrollReq.setIdemixCredReq(idemixCredRequest);
+            body = idemixEnrollReq.toJson();
+            result = httpPost(url + HFCA_IDEMIXCRED, body, enrollment);
+            if (result == null) {
+                throw new EnrollmentException("No response received for idemix enrollment request");
+            }
+
+            // Deserialize idemix credential
+            String credential = result.getString("Credential");
+            if (Utils.isNullOrEmpty(credential)) {
+                throw new InvalidArgumentException("fabric-ca-server did not return a 'credential' in the response from " + HFCA_IDEMIXCRED);
+            }
+
+            // Deserialize idemix cri (Credential Revocation Information)
+            String criStr = result.getString("CRI");
+            if (Utils.isNullOrEmpty(criStr)) {
+                throw new InvalidArgumentException("fabric-ca-server did not return a 'CRI' in the response from " + HFCA_IDEMIXCRED);
+            }
+
+            JsonObject attrs = result.getJsonObject("Attrs");
+            if (attrs == null) {
+                throw new EnrollmentException("fabric-ca-server did not return 'attrs' in the response from " + HFCA_IDEMIXCRED);
+            }
+            String ou = attrs.getString("OU");
+            if (Utils.isNullOrEmpty(ou)) {
+                throw new InvalidArgumentException("fabric-ca-server did not return a 'ou' attribute in the response from " + HFCA_IDEMIXCRED);
+            }
+            int role = attrs.getInt("Role"); // Encoded IdemixRole from Fabric-Ca
+
+            // Return the idemix enrollment
+            byte[] skArray = new byte[32];
+            sk.toBytes(skArray);
+
+
+            JsonObjectBuilder builder = Json.createObjectBuilder();
+            builder.add("ipk", info.getString("IssuerPublicKey"));
+            builder.add("rpk", info.getString("IssuerRevocationPublicKey"));
+            builder.add("mspID", mspID);
+            builder.add("sk", Base64.getEncoder().encodeToString(skArray));
+            builder.add("cred", credential);
+            builder.add("cri", criStr);
+            builder.add("ou", ou);
+            builder.add("role", role);
+            return builder.build();
+        } catch (EnrollmentException ee) {
+            logger.error(ee.getMessage(), ee);
+            throw ee;
+        } catch (Exception e) {
+            EnrollmentException ee = new EnrollmentException("Failed to get Idemix credential", e);
+            logger.error(e.getMessage(), e);
+            throw ee;
+        }
+    }
+
+    public Enrollment getIdemixEnrollmentFromJson(JsonObject json) throws Exception {
+
+        String mspID = json.getString("mspID");
+        IdemixIssuerPublicKey ipk = getIssuerPublicKey(json.getString("ipk"));
+        PublicKey rpk = getRevocationPublicKey(json.getString("rpk"));
+        //Deserialize sk
+        BIG sk = BIG.fromBytes(Base64.getDecoder().decode(json.getString("sk")));
+
+        // Deserialize idemix credential
+        String credential = json.getString("cred");
+        if (Utils.isNullOrEmpty(credential)) {
+            throw new InvalidArgumentException("fabric-ca-server did not return a 'credential' in the response from " + HFCA_IDEMIXCRED);
+        }
+        byte[] credBytes = Base64.getDecoder().decode(credential.getBytes(UTF_8));
+        Idemix.Credential credProto = Idemix.Credential.parseFrom(credBytes);
+        IdemixCredential cred = new IdemixCredential(credProto);
+
+        String ou = json.getString("ou");
+        if (Utils.isNullOrEmpty(ou)) {
+            throw new InvalidArgumentException("fabric-ca-server did not return a 'ou' attribute in the response from " + HFCA_IDEMIXCRED);
+        }
+        int role = json.getInt("role"); // Encoded IdemixRole from Fabric-Ca
+
+        // Deserialize idemix cri (Credential Revocation Information)
+        String criStr = json.getString("cri");
+        if (Utils.isNullOrEmpty(criStr)) {
+            throw new InvalidArgumentException("fabric-ca-server did not return a 'CRI' in the response from " + HFCA_IDEMIXCRED);
+        }
+        byte[] criBytes = Base64.getDecoder().decode(criStr.getBytes(UTF_8));
+        Idemix.CredentialRevocationInformation cri = Idemix.CredentialRevocationInformation.parseFrom(criBytes);
+
+        return new IdemixEnrollment(ipk, rpk, mspID, sk, cred, cri, ou, role);
+    }
+
     private IdemixIssuerPublicKey getIssuerPublicKey(String str) throws EnrollmentException, InvalidProtocolBufferException {
         if (Utils.isNullOrEmpty(str)) {
             throw new EnrollmentException("fabric-ca-server did not return 'issuerPublicKey' in the response from " + HFCA_IDEMIXCRED);
@@ -1625,7 +1759,7 @@ public class HFCAClient {
                     logger.warn("SSL CA client key is specified as bytes and as a file path. Using client key specified as bytes.");
                 }
                 if (tlsClientKeyFile != null && tlsClientKeyAsBytes == null) {
-                     tlsClientKeyAsBytes = Files.readAllBytes(Paths.get(tlsClientKeyFile));
+                    tlsClientKeyAsBytes = Files.readAllBytes(Paths.get(tlsClientKeyFile));
                 }
                 byte[] tlsClientCertAsBytes = (byte[]) properties.get("tlsClientCertBytes");
                 if (tlsClientCertFile != null && tlsClientCertAsBytes != null) {
@@ -1639,14 +1773,14 @@ public class HFCAClient {
                     cryptoPrimitives.addClientCACertificateToTrustStore(tlsClientKeyAsBytes, tlsClientCertAsBytes, null);
                 }
 
-               SSLContext sslContext = SSLContexts.custom()
-               .loadKeyMaterial(cryptoPrimitives.getTrustStore(), new char[0])
-               .loadTrustMaterial(cryptoPrimitives.getTrustStore(), null)
-               .build();
+                SSLContext sslContext = SSLContexts.custom()
+                        .loadKeyMaterial(cryptoPrimitives.getTrustStore(), new char[0])
+                        .loadTrustMaterial(cryptoPrimitives.getTrustStore(), null)
+                        .build();
 
                 final ConnectionSocketFactory sslSocketFactory;
                 if (properties != null &&
-                    Boolean.parseBoolean(properties.getProperty("allowAllHostNames"))) {
+                        Boolean.parseBoolean(properties.getProperty("allowAllHostNames"))) {
                     sslSocketFactory = new SSLConnectionSocketFactory(sslContext, (hostname, session) -> true);
                 } else {
                     sslSocketFactory = new SSLConnectionSocketFactory(sslContext);
@@ -1757,4 +1891,3 @@ public class HFCAClient {
     }
 
 }
-
